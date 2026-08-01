@@ -318,6 +318,84 @@ pub struct App {
 }
 
 impl App {
+    /// Spawn the heartbeat + PAM conversation task for the lock screen and
+    /// record it as the current [`State::Locked`] task.
+    fn start_auth_task(&mut self) -> Task<Message> {
+        let username = self.flags.user_data.name.clone();
+        let (locked_task, locked_handle) = cosmic::task::stream(cosmic::iced::stream::channel(
+            16,
+            |mut msg_tx: futures::channel::mpsc::Sender<_>| async move {
+                // Send heartbeat once a second to update time.
+                let heartbeat_future = {
+                    let mut output = msg_tx.clone();
+                    async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                        loop {
+                            output
+                                .send(cosmic::Action::App(Message::None))
+                                .await
+                                .unwrap();
+
+                            interval.tick().await;
+                        }
+                    }
+                };
+
+                let pam_future = async {
+                    loop {
+                        let (value_tx, value_rx) = mpsc::channel(16);
+                        msg_tx
+                            .send(cosmic::Action::App(Message::Channel(value_tx)))
+                            .await
+                            .unwrap();
+
+                        let pam_res = {
+                            let username = username.clone();
+                            let msg_tx = msg_tx.clone();
+                            task::spawn_blocking(move || {
+                                pam_thread(username, Conversation { msg_tx, value_rx })
+                            })
+                            .await
+                            .unwrap()
+                        };
+
+                        match pam_res {
+                            Ok(()) => {
+                                tracing::info!("successfully authenticated");
+                                msg_tx
+                                    .send(cosmic::Action::App(Message::Unlock))
+                                    .await
+                                    .unwrap();
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::warn!("authentication error: {}", err);
+                                msg_tx
+                                    .send(cosmic::Action::App(Message::Error(
+                                        pam_error_to_message(&err),
+                                    )))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                };
+
+                futures::pin_mut!(heartbeat_future);
+                futures::pin_mut!(pam_future);
+                futures::future::select(heartbeat_future, pam_future).await;
+            },
+        ))
+        .abortable();
+
+        self.state = State::Locked {
+            task_handle: locked_handle,
+        };
+
+        locked_task
+    }
+
     fn menu(&self, surface_id: SurfaceId) -> Element<'_, Message> {
         let window_width = self
             .common
@@ -871,85 +949,10 @@ impl cosmic::Application for App {
                         return Task::none();
                     }
 
-                    let username = self.flags.user_data.name.clone();
-                    let (locked_task, locked_handle) =
-                        cosmic::task::stream(cosmic::iced::stream::channel(
-                            16,
-                            |mut msg_tx: futures::channel::mpsc::Sender<_>| async move {
-                                // Send heartbeat once a second to update time.
-                                let heartbeat_future = {
-                                    let mut output = msg_tx.clone();
-                                    async move {
-                                        let mut interval =
-                                            tokio::time::interval(Duration::from_secs(1));
-
-                                        loop {
-                                            output
-                                                .send(cosmic::Action::App(Message::None))
-                                                .await
-                                                .unwrap();
-
-                                            interval.tick().await;
-                                        }
-                                    }
-                                };
-
-                                let pam_future = async {
-                                    loop {
-                                        let (value_tx, value_rx) = mpsc::channel(16);
-                                        msg_tx
-                                            .send(cosmic::Action::App(Message::Channel(value_tx)))
-                                            .await
-                                            .unwrap();
-
-                                        let pam_res = {
-                                            let username = username.clone();
-                                            let msg_tx = msg_tx.clone();
-                                            task::spawn_blocking(move || {
-                                                pam_thread(
-                                                    username,
-                                                    Conversation { msg_tx, value_rx },
-                                                )
-                                            })
-                                            .await
-                                            .unwrap()
-                                        };
-
-                                        match pam_res {
-                                            Ok(()) => {
-                                                tracing::info!("successfully authenticated");
-                                                msg_tx
-                                                    .send(cosmic::Action::App(Message::Unlock))
-                                                    .await
-                                                    .unwrap();
-                                                break;
-                                            }
-                                            Err(err) => {
-                                                tracing::warn!("authentication error: {}", err);
-                                                msg_tx
-                                                    .send(cosmic::Action::App(Message::Error(
-                                                        pam_error_to_message(&err),
-                                                    )))
-                                                    .await
-                                                    .unwrap();
-                                            }
-                                        }
-                                    }
-                                };
-
-                                futures::pin_mut!(heartbeat_future);
-                                futures::pin_mut!(pam_future);
-                                futures::future::select(heartbeat_future, pam_future).await;
-                            },
-                        ))
-                        .abortable();
+                    let locked_task = self.start_auth_task();
 
                     let mut commands = Vec::with_capacity(self.common.surface_ids.len() + 1);
                     commands.push(locked_task);
-
-                    self.state = State::Locked {
-                        task_handle: locked_handle,
-                    };
 
                     // Allow suspend
                     self.inhibit_opt = None;
