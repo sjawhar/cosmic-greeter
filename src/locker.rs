@@ -7,6 +7,7 @@ use cosmic::cctk::wayland_protocols::xdg::shell::client::xdg_positioner::Gravity
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::event::wayland::{OutputEvent, SessionLockEvent};
 use cosmic::iced::futures::{self, SinkExt};
+use cosmic::iced::keyboard::{Key, key::Named};
 use cosmic::iced::platform_specific::shell::wayland::commands::session_lock::{
     destroy_lock_surface, lock, unlock,
 };
@@ -274,6 +275,7 @@ pub enum Message {
     DropdownToggle(Dropdown),
     KeyboardLayout(usize),
     Inhibit(Arc<OwnedFd>),
+    RestartAuth,
     Submit(String),
     Surface(surface::Action<Message>),
     Suspend,
@@ -395,6 +397,12 @@ impl App {
         self.state = State::Locked {
             task_handle: locked_handle,
         };
+        // The previous conversation's prompt and value channel are dead: the new
+        // task sends a replacement channel via Message::Channel, and clearing the
+        // prompt lets Common::update refocus the field when the new one arrives.
+        self.common.prompt_opt = None;
+        self.value_tx_opt = None;
+        self.authenticating = false;
 
         locked_task
     }
@@ -649,7 +657,8 @@ impl App {
                                     common::Message::Prompt(prompt.clone(), *secret, Some(input))
                                         .into()
                                 })
-                                .on_submit(Message::Submit);
+                                .on_submit(Message::Submit)
+                                .on_unfocus(Message::RestartAuth);
                         }
 
                         if *secret {
@@ -818,6 +827,18 @@ impl cosmic::Application for App {
                     self.authenticating = false;
                     self.common.prompt_opt = None;
                 }
+
+                // Escape reaches the app as a key event only while the password
+                // field is unfocused; when it is focused the field consumes it and
+                // reports on_unfocus instead. Handle both so the gesture works
+                // regardless of focus state.
+                if matches!(
+                    common_message,
+                    common::Message::Key(_, Key::Named(Named::Escape), _)
+                ) {
+                    return self.update(Message::RestartAuth);
+                }
+
                 return self.common.update(common_message);
             }
             Message::OutputEvent(output_event, output) => {
@@ -1109,10 +1130,34 @@ impl cosmic::Application for App {
                     return self.common.dropdown_blur_rects(false);
                 }
             }
+            Message::RestartAuth => {
+                // The conversation starts when the session locks, so modules with
+                // short hardware windows (pam_u2f touch, pam_fprintd) have timed
+                // out by the time the user returns, leaving only the password
+                // prompt live. Restarting the conversation offers them again.
+                // Until now the only way to do that was to submit a wrong
+                // password, which makes the conversation loop restart.
+                //
+                // Reached by pressing Escape, by clicking away from the password
+                // field, and by submitting an empty password. All are deliberate,
+                // none can happen while typing a password, and none can occur
+                // unattended.
+                if matches!(self.state, State::Locked { .. }) && !self.authenticating {
+                    tracing::info!("restarting authentication conversation");
+                    return self.start_auth_task();
+                }
+            }
             Message::Submit(value) => {
+                // An empty submission is never a real password attempt. While
+                // locked it is a restart request (see Message::RestartAuth);
+                // otherwise it is ignored.
                 if value.is_empty() {
+                    if matches!(self.state, State::Locked { .. }) {
+                        return self.update(Message::RestartAuth);
+                    }
                     return Task::none();
                 }
+
                 self.common.error_opt = None;
                 self.authenticating = true;
                 match self.value_tx_opt.take() {
@@ -1122,7 +1167,11 @@ impl cosmic::Application for App {
                             Message::Channel(value_tx)
                         });
                     }
-                    None => tracing::warn!("tried to submit when value_tx_opt not set"),
+                    None => {
+                        // Possible if a submit races a conversation restart.
+                        tracing::warn!("tried to submit when value_tx_opt not set");
+                        self.authenticating = false;
+                    }
                 }
             }
             Message::Suspend => {
